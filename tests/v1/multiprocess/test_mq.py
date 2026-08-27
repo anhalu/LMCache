@@ -754,6 +754,79 @@ def test_shared_loop_survives_undecodable_response():
         router.close()
 
 
+def test_sync_handler_error_reaches_client():
+    """
+    Test that a raising SYNC handler fails the caller instead of hanging it.
+
+    The server used to only log the exception and send nothing back, so the
+    caller blocked for the whole mq_timeout (300 s by default) and then saw a
+    misleading "server did not respond" error.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.mq import RemoteHandlerError
+
+    server_url = "tcp://127.0.0.1:16031"
+    context = zmq.Context.instance()
+
+    def failing_handler() -> int:
+        raise RuntimeError("handler exploded")
+
+    server = MessageQueueServer(server_url, context)
+    add_handler_helper(server, RequestType.GET_CHUNK_SIZE, failing_handler)
+    server.start()
+
+    try:
+        client = MessageQueueClient(server_url, context)
+        future = client.submit_request(RequestType.GET_CHUNK_SIZE, [])
+
+        with pytest.raises(RemoteHandlerError) as excinfo:
+            future.result(timeout=5)
+
+        # The original server-side failure must survive the round trip.
+        assert "handler exploded" in str(excinfo.value)
+
+        client.close()
+    finally:
+        server.close()
+
+
+def test_sync_handler_success_paths_unaffected():
+    """
+    Test that the error frame does not collide with successful responses.
+
+    A success carries one response frame, or zero when response_class is None;
+    the error frame is a two-frame reply led by a marker. Both success shapes
+    must still round-trip unchanged.
+    """
+    server_url = "tcp://127.0.0.1:16032"
+    context = zmq.Context.instance()
+
+    def chunk_size_handler() -> int:
+        return 256
+
+    def unregister_handler(instance_id: int) -> None:
+        return None
+
+    server = MessageQueueServer(server_url, context)
+    add_handler_helper(server, RequestType.GET_CHUNK_SIZE, chunk_size_handler)
+    add_handler_helper(server, RequestType.UNREGISTER_KV_CACHE, unregister_handler)
+    server.start()
+
+    try:
+        client = MessageQueueClient(server_url, context)
+
+        # One response frame.
+        assert client.submit_request(RequestType.GET_CHUNK_SIZE, []).result(5) == 256
+
+        # Zero response frames (response_class is None).
+        future = client.submit_request(RequestType.UNREGISTER_KV_CACHE, [7])
+        assert future.result(timeout=5) is None
+
+        client.close()
+    finally:
+        server.close()
+
+
 def test_shared_loop_recreate():
     """
     Test that closing all clients and creating new ones starts a fresh loop.

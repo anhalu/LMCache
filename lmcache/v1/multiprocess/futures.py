@@ -16,6 +16,7 @@ class MessagingFuture(Generic[T]):
     def __init__(self) -> None:
         self.is_done_ = threading.Event()
         self.result_: T | None = None
+        self.exception_: BaseException | None = None
         self._retained_references: list[object] = []
 
     def query(self) -> bool:
@@ -53,11 +54,28 @@ class MessagingFuture(Generic[T]):
 
         Raises:
             TimeoutError: If the future is not done within the timeout.
+            BaseException: Whatever the server reported, when the request
+                failed remotely (see ``set_exception``).
         """
         flag = self.wait(timeout)
         if not flag:
             raise LMCacheTimeoutError("Future result not available within timeout")
+        if self.exception_ is not None:
+            raise self.exception_
         return cast(T, self.result_)
+
+    def set_exception(self, exception: BaseException) -> None:
+        """Complete the future with a failure instead of a result.
+
+        Called by the messaging system when the server reports that its
+        handler raised, so the caller fails immediately rather than blocking
+        until ``mq_timeout``.
+
+        Args:
+            exception (BaseException): The failure to raise from ``result()``.
+        """
+        self.exception_ = exception
+        self.is_done_.set()
 
     def set_result(self, result: T) -> None:
         """

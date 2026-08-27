@@ -35,6 +35,21 @@ from lmcache.v1.platform import EventNotifier, create_event_notifier
 
 logger = init_logger(__name__)
 
+# Marks a response as carrying a remote handler failure rather than a result.
+# A successful response has 0 frames (``response_class=None``) or 1, so a
+# two-frame response led by this marker is unambiguous.
+ERROR_RESPONSE_MARKER = b"\x00LMCACHE_ERR"
+
+
+class RemoteHandlerError(RuntimeError):
+    """A server-side request handler raised; re-raised in the calling process.
+
+    Without this the server only logs the failure and sends nothing back, so
+    the caller blocks until ``mq_timeout`` (300 s by default) and then reports
+    a misleading "server did not respond" connection error.
+    """
+
+
 T = TypeVar("T")
 
 # Internal type used for the client-server communication
@@ -360,7 +375,14 @@ class MessageQueueClient:
 
         if request_uid in self.pending_futures:
             future = self.pending_futures.pop(request_uid)
-            if b_response:
+            if len(b_response) == 2 and b_response[0] == ERROR_RESPONSE_MARKER:
+                future.set_exception(
+                    RemoteHandlerError(
+                        f"{request_type.name} failed on the LMCache server: "
+                        f"{b_response[1].decode(errors='replace')}"
+                    )
+                )
+            elif b_response:
                 response = msgspec_decode(b_response[0], cls=response_cls)
                 future.set_result(response)
             else:
@@ -544,7 +566,17 @@ class MessageQueueServer:
             payloads (list[bytes]): The payloads of the request.
             prefix_frames (list[bytes]): The prefix frames to send back.
         """
-        response = handler_entry(payloads)
+        try:
+            response = handler_entry(payloads)
+        except Exception as e:
+            # Report the failure before re-raising. Only this point knows that
+            # nothing has been sent yet, so the error response cannot race a
+            # successful one; _main_loop still logs the traceback.
+            self.socket.send_multipart(
+                prefix_frames
+                + [ERROR_RESPONSE_MARKER, f"{type(e).__name__}: {e}".encode()]
+            )
+            raise
         response_cls = handler_entry.get_response_class()
         b_response = msgspec_encode(response, cls=response_cls)
         if response is not None:
