@@ -4,9 +4,11 @@ from multiprocessing.synchronize import Event as EventClass
 from typing import Any, Callable
 import multiprocessing as mp
 import sys
+import threading
 import time
 
 # Third Party
+import msgspec
 import pytest
 import torch
 import zmq
@@ -685,6 +687,71 @@ def test_shared_loop_dispatch():
         assert ClientPollingLoop._instance is None
     finally:
         server.close()
+
+
+def test_shared_loop_survives_undecodable_response():
+    """
+    Test that one undecodable inbound frame does not kill the shared loop.
+
+    RequestType is an enum.auto() enum, so its wire values are declaration
+    positions: a peer running a newer protocol can answer with a value this
+    build's enum does not contain, and decoding it raises inside
+    process_inbound.
+
+    ClientPollingLoop is a process-wide singleton thread serving every client,
+    so an unhandled raise there strands all of them. The loop must instead drop
+    the offending frame and keep serving.
+    """
+    # First Party
+    from lmcache.v1.multiprocess.mq import ClientPollingLoop
+
+    server_url = "tcp://127.0.0.1:16030"
+    context = zmq.Context.instance()
+
+    unknown_value = max(member.value for member in RequestType) + 1
+    b_unknown = msgspec.msgpack.encode(unknown_value)
+
+    router = context.socket(zmq.ROUTER)
+    router.bind(server_url)
+
+    def serve():
+        # First an undecodable reply, then a well-formed one, so the second
+        # request's fate isolates the blast radius of the first.
+        identity, b_uid, _b_type, *_ = router.recv_multipart()
+        router.send_multipart([identity, b_uid, b_unknown])
+
+        identity, b_uid, b_type, *_ = router.recv_multipart()
+        router.send_multipart([identity, b_uid, b_type, msgspec.msgpack.encode(256)])
+
+    threading.Thread(target=serve, daemon=True).start()
+
+    try:
+        client = MessageQueueClient(server_url, context)
+
+        loop = ClientPollingLoop._instance
+        assert loop is not None
+        assert loop._thread.is_alive()
+
+        # The poisoned request cannot be resolved - without a usable
+        # request_type there is no way to match it to its future - so it still
+        # times out. Only the blast radius is under test here.
+        poisoned = client.submit_request(RequestType.GET_CHUNK_SIZE, [])
+        with pytest.raises(TimeoutError):
+            poisoned.result(timeout=1)
+
+        # The loop must have survived the bad frame...
+        assert loop._thread.is_alive(), (
+            "shared polling loop died on an undecodable frame; every client "
+            "in this process would be stranded until restart"
+        )
+
+        # ...and an unrelated, well-formed request must still complete.
+        healthy = client.submit_request(RequestType.GET_CHUNK_SIZE, [])
+        assert healthy.result(timeout=5) == 256
+
+        client.close()
+    finally:
+        router.close()
 
 
 def test_shared_loop_recreate():
